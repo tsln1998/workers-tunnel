@@ -43,7 +43,7 @@ mod proxy {
 
     use crate::websocket::WebSocketStream;
     use base64::{decode_config, URL_SAFE_NO_PAD};
-    use tokio::io::{copy_bidirectional, AsyncReadExt};
+    use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
     use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
@@ -194,6 +194,8 @@ mod proxy {
             }
         };
 
+        client_socket.write(&[0u8, 0u8]).await?;
+
         copy_bidirectional(&mut client_socket, &mut remote_socket).await?;
 
         Ok(())
@@ -238,7 +240,6 @@ mod websocket {
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-        init_state: bool,
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -256,7 +257,6 @@ mod websocket {
                 ws,
                 stream,
                 buffer: buff,
-                init_state: true,
             }
         }
     }
@@ -299,22 +299,7 @@ mod websocket {
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
-            let this = self.project();
-
-            if *this.init_state {
-                // 发送第一个包时需要加上 vless 的协议 response 头
-                *this.init_state = false;
-
-                return match this
-                    .ws
-                    .send_with_bytes([&[0u8, 0u8], buf].concat().to_vec().as_slice())
-                {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
-                };
-            }
-
-            match this.ws.send_with_bytes(buf) {
+            match self.ws.send_with_bytes(buf) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
@@ -325,8 +310,7 @@ mod websocket {
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            let this = self.project();
-            match this.ws.close(None, Some("normal close")) {
+            match self.ws.close(None, Some("normal close")) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
