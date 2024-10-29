@@ -6,6 +6,15 @@ use worker::*;
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     // get user id
     let user_id = env.var("USER_ID")?.to_string();
+    let user_id = parse_user_id(&user_id);
+
+    // get proxy ip list
+    let proxy_ip = env.var("PROXY_IP")?.to_string();
+    let proxy_ip = proxy_ip
+        .split_ascii_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>();
 
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
@@ -16,20 +25,20 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     server.accept()?;
 
     wasm_bindgen_futures::spawn_local(async move {
-        let event_stream = server.events().expect("could not open stream");
+        // create websocket stream
+        let socket = WebSocketStream::new(
+            &server,
+            server.events().expect("could not open stream"),
+            early_data,
+        );
 
-        let user_id = parse_user_id(&user_id);
-        let socket = WebSocketStream::new(&server, event_stream, early_data);
-
-        // run vless tunnel
-        if let Err(err) = run_tunnel(socket, &user_id).await {
+        // into tunnel
+        if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
             // log error
             console_error!("error: {}", err);
 
             // close websocket connection
-            server
-                .close(Some(1003), Some("invalid request"))
-                .unwrap_or_default();
+            _ = server.close(Some(1003), Some("invalid request"));
         }
     });
 
@@ -90,7 +99,11 @@ mod proxy {
         bytes
     }
 
-    pub async fn run_tunnel(mut client_socket: WebSocketStream<'_>, user_id: &[u8]) -> Result<()> {
+    pub async fn run_tunnel(
+        mut client_socket: WebSocketStream<'_>,
+        user_id: Vec<u8>,
+        proxy_ip: Vec<String>,
+    ) -> Result<()> {
         // read version
         if client_socket.read_u8().await? != protocol::VERSION {
             return Err(std::io::Error::new(
@@ -116,12 +129,7 @@ mod proxy {
         }
 
         // read network type
-        if client_socket.read_u8().await? != protocol::NETWORK_TYPE_TCP {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid network type, expected TCP",
-            ));
-        }
+        let network_type = client_socket.read_u8().await?;
 
         // read remote port
         let remote_port = client_socket.read_u16().await?;
@@ -144,37 +152,84 @@ mod proxy {
             }
         };
 
-        // connect to remote socket
-        let mut remote_socket = match Socket::builder().connect(remote_addr.clone(), remote_port) {
-            Ok(socket) => socket,
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    format!(
-                        "connect to remote {}:{} failed: {}",
-                        remote_addr,
-                        remote_port,
-                        e.to_string()
-                    ),
-                ));
+        // process outbound
+        match network_type {
+            protocol::NETWORK_TYPE_TCP => {
+                let targets = vec![vec![remote_addr], proxy_ip].concat();
+
+                for target in targets {
+                    match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
+                        Ok(_) => {
+                            // normal closed
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            // connection reset
+                            if e.kind() != ErrorKind::ConnectionReset {
+                                return Err(e);
+                            }
+
+                            // continue to next target
+                            continue;
+                        }
+                    }
+                }
+
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "no target to connect",
+                ))
             }
-        };
+            protocol::NETWORK_TYPE_UDP => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not supported udp proxy yet",
+            )),
+            unknown => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported network type: {}", unknown),
+            )),
+        }
+    }
 
-        // write response header
-        client_socket.write(&protocol::RESPONSE).await?;
+    async fn process_tcp_outbound(
+        client_socket: &mut WebSocketStream<'_>,
+        target: &str,
+        port: u16,
+    ) -> Result<()> {
+        // connect to remote socket
+        let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!("connect to remote failed: {}", e),
+            )
+        })?;
 
-        // forward data
-        copy_bidirectional(&mut client_socket, &mut remote_socket)
+        // check remote socket
+        remote_socket.opened().await.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                format!("remote socket not opened: {}", e),
+            )
+        })?;
+
+        // send response header
+        client_socket
+            .write(&protocol::RESPONSE)
             .await
             .map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
-                    format!(
-                        "forward remote {}:{} failed: {}",
-                        remote_addr,
-                        remote_port,
-                        e.to_string()
-                    ),
+                    format!("send response header failed: {}", e),
+                )
+            })?;
+
+        // forward data
+        copy_bidirectional(client_socket, &mut remote_socket)
+            .await
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("forward data between client and remote failed: {}", e),
                 )
             })?;
 
