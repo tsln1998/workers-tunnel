@@ -229,14 +229,7 @@ mod proxy {
             })?;
 
         // forward data
-        copy_bidirectional(client_socket, &mut remote_socket)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("forward data between client and remote failed: {}", e),
-                )
-            })?;
+        _ = copy_bidirectional(client_socket, &mut remote_socket).await;
 
         Ok(())
     }
