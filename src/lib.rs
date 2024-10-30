@@ -4,17 +4,23 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    // get user id
-    let user_id = env.var("USER_ID")?.to_string();
-    let user_id = parse_user_id(&user_id);
+    // check base url is valid
+    let base_url = env.var("BASE_URL")?.to_string();
+    if !base_url.is_empty() && !base_url.eq(&req.url().unwrap().path()) {
+        return Response::error("Not Found", 404);
+    }
 
-    // get proxy ip list
-    let proxy_ip = env.var("PROXY_IP")?.to_string();
-    let proxy_ip = proxy_ip
-        .split_ascii_whitespace()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect::<Vec<String>>();
+    // check http connection upgrade
+    let connection = req.headers().get("connection")?.unwrap_or_default();
+    if !connection.eq_ignore_ascii_case("upgrade") {
+        return Response::error("Not Found", 404);
+    }
+
+    // check websocket upgrade
+    let upgrade = req.headers().get("upgrade")?.unwrap_or_default();
+    if !upgrade.eq_ignore_ascii_case("websocket") {
+        return Response::error("Not Found", 404);
+    }
 
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
@@ -24,21 +30,35 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let WebSocketPair { client, server } = WebSocketPair::new()?;
     server.accept()?;
 
-    wasm_bindgen_futures::spawn_local(async move {
-        // create websocket stream
-        let socket = WebSocketStream::new(
-            &server,
-            server.events().expect("could not open stream"),
-            early_data,
-        );
+    wasm_bindgen_futures::spawn_local({
+        // get user id
+        let user_id = env.var("USER_ID")?.to_string();
+        let user_id = parse_user_id(&user_id);
 
-        // into tunnel
-        if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
-            // log error
-            console_error!("error: {}", err);
+        // get proxy ip list
+        let proxy_ip = env.var("PROXY_IP")?.to_string();
+        let proxy_ip = proxy_ip
+            .split_ascii_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
 
-            // close websocket connection
-            _ = server.close(Some(1003), Some("invalid request"));
+        async move {
+            // create websocket stream
+            let socket = WebSocketStream::new(
+                &server,
+                server.events().expect("could not open stream"),
+                early_data,
+            );
+
+            // into tunnel
+            if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
+                // log error
+                console_error!("error: {}", err);
+
+                // close websocket connection
+                _ = server.close(Some(1003), Some("invalid request"));
+            }
         }
     });
 

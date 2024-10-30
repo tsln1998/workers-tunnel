@@ -108,7 +108,9 @@ Please refer to the following documentation for development and deployment.
 
 ```toml
 [vars]
+BASE_URL = ""
 USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+PROXY_IP = ""
 ```
 
 ## Setup
